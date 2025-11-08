@@ -1,0 +1,396 @@
+#include <Servo.h>
+
+// Пины для моторов
+const int speedLeft = 6;
+const int speedRight = 5;
+const int dirLeft = 7;
+const int dirRight = 4;
+
+// Пины для датчиков линии
+const int leftSensor = 8;
+const int rightSensor = 9;
+
+// Пин для кнопки
+const int buttonPin = 2;
+
+// Пин для светодиода
+const int ledPin = 13;
+
+// Пины для сервопривода и дальномера
+const int servoPin = 10;
+const int trigPin = 11;
+const int echoPin = 12;
+
+// Скорости
+const int normalSpeed = 150;
+const int turnSpeed = 150;
+
+// Переменные для кнопки
+bool buttonPressed = false;
+bool longPressActivated = false;
+unsigned long buttonPressTime = 0;
+const unsigned long longPressTime = 2000;
+
+// Режимы работы
+enum RobotMode { STOP, LINE_FOLLOWING, SQUARE };
+RobotMode currentMode = STOP;
+
+// Для режима квадрата
+unsigned long actionStartTime = 0;
+int squareStep = 0;
+int sidesCompleted = 0;
+
+// Для сервопривода и сканирования
+Servo myServo;
+int scanAngle = 90; // начальный угол - центр
+int scanDirection = 1; // 1 - вправо, -1 - влево
+unsigned long lastScanTime = 0;
+const int scanInterval = 15;
+const int centerAngle = 90;
+const int leftAngle = 30;
+const int rightAngle = 150;
+
+// Для обнаружения препятствий
+long currentDistance = 0;
+const int obstacleThreshold = 15;
+bool obstacleDetected = false;
+unsigned long lastDistanceTime = 0;
+const int distanceInterval = 40;
+
+// Флаг активности сервопривода и светодиода
+bool systemActive = false;
+
+void setup() {
+  // Настройка пинов
+  pinMode(buttonPin, INPUT_PULLUP);
+  pinMode(leftSensor, INPUT);
+  pinMode(rightSensor, INPUT);
+  pinMode(ledPin, OUTPUT);
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  
+  pinMode(speedLeft, OUTPUT);
+  pinMode(speedRight, OUTPUT);
+  pinMode(dirLeft, OUTPUT);
+  pinMode(dirRight, OUTPUT);
+  
+  // Настройка сервопривода (но не активируем сканирование)
+  myServo.attach(servoPin);
+  myServo.write(centerAngle); // начальное положение - центр
+  
+  stopMotors();
+  digitalWrite(ledPin, LOW); // Светодиод выключен
+  Serial.begin(9600);
+}
+
+void loop() {
+  // Обработка кнопки
+  handleButton();
+  
+  // Управление светодиодом в зависимости от режима
+  updateLED();
+  
+  // Активное сканирование только когда система активна
+  if (systemActive) {
+    continuousScan();
+    
+    // Измерение расстояния (реже, чтобы не замедлять сканирование)
+    if (millis() - lastDistanceTime > distanceInterval) {
+      measureDistance();
+      lastDistanceTime = millis();
+    }
+    
+    // Проверка препятствий и реакция
+    checkObstacle();
+  }
+  
+  // Выполнение текущего режима
+  switch (currentMode) {
+    case STOP:
+      stopMotors();
+      break;
+    case LINE_FOLLOWING:
+      followLine();
+      break;
+    case SQUARE:
+      makeSquare();
+      break;
+  }
+}
+
+void handleButton() {
+  int buttonState = digitalRead(buttonPin);
+  
+  // Нажатие кнопки
+  if (buttonState == LOW && !buttonPressed) {
+    buttonPressed = true;
+    buttonPressTime = millis();
+  }
+  
+  // Отпускание кнопки
+  if (buttonState == HIGH && buttonPressed) {
+    buttonPressed = false;
+    
+    // Короткое нажатие - следование по линии
+    if (millis() - buttonPressTime < longPressTime && !longPressActivated) {
+      currentMode = LINE_FOLLOWING;
+      systemActive = true; // Активируем систему
+      Serial.println("Line following started");
+    }
+    longPressActivated = false;
+  }
+  
+  // Долгое нажатие - квадрат
+  if (buttonPressed && millis() - buttonPressTime > longPressTime && !longPressActivated) {
+    longPressActivated = true;
+    currentMode = SQUARE;
+    systemActive = true; // Активируем систему
+    squareStep = 0;
+    sidesCompleted = 0;
+    actionStartTime = millis();
+    Serial.println("Square mode started");
+  }
+}
+
+void updateLED() {
+  static unsigned long lastBlinkTime = 0;
+  static bool ledState = false;
+  
+  // Если система не активна - выключаем светодиод
+  if (!systemActive) {
+    digitalWrite(ledPin, LOW);
+    return;
+  }
+  
+  switch (currentMode) {
+    case STOP:
+      // Мигание при остановке
+      if (millis() - lastBlinkTime > 500) {
+        ledState = !ledState;
+        digitalWrite(ledPin, ledState);
+        lastBlinkTime = millis();
+      }
+      break;
+      
+    case LINE_FOLLOWING:
+      // Горит постоянно при движении по линии
+      digitalWrite(ledPin, HIGH);
+      break;
+      
+    case SQUARE:
+      // Мигает быстро при выполнении квадрата
+      if (millis() - lastBlinkTime > 200) {
+        ledState = !ledState;
+        digitalWrite(ledPin, ledState);
+        lastBlinkTime = millis();
+      }
+      break;
+  }
+  
+  // Если квадрат завершен, светодиод горит постоянно
+  if (currentMode == STOP && sidesCompleted >= 4) {
+    digitalWrite(ledPin, HIGH);
+  }
+  
+  // Мигает быстро при обнаружении препятствия
+  if (obstacleDetected) {
+    if (millis() - lastBlinkTime > 100) {
+      ledState = !ledState;
+      digitalWrite(ledPin, ledState);
+      lastBlinkTime = millis();
+    }
+  }
+}
+
+void continuousScan() {
+  // Сканирование только когда система активна
+  if (!systemActive) {
+    myServo.write(centerAngle); // Держим серво в центре
+    return;
+  }
+  
+  // Сверхбыстрое сканирование сервоприводом ±60 градусов
+  if (millis() - lastScanTime > scanInterval) {
+    // Увеличиваем шаг сканирования для большей скорости
+    scanAngle += scanDirection * 5;
+    
+    // Меняем направление при достижении границ
+    if (scanAngle >= rightAngle) {
+      scanAngle = rightAngle;
+      scanDirection = -1;
+    } else if (scanAngle <= leftAngle) {
+      scanAngle = leftAngle;
+      scanDirection = 1;
+    }
+    
+    // Устанавливаем угол сервы
+    myServo.write(scanAngle);
+    lastScanTime = millis();
+  }
+}
+
+void measureDistance() {
+  // Измеряем расстояние только когда система активна
+  if (!systemActive) return;
+  
+  // Быстрое измерение расстояния ультразвуковым датчиком
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(5);
+  digitalWrite(trigPin, LOW);
+  
+  // Используем таймаут для pulseIn, чтобы не блокировать выполнение
+  long duration = pulseIn(echoPin, HIGH, 3000);
+  
+  if (duration == 0) {
+    currentDistance = 999;
+  } else {
+    currentDistance = duration * 0.034 / 2;
+  }
+  
+  // Выводим информацию в Serial (реже, чтобы не замедлять)
+  static unsigned long lastPrintTime = 0;
+  if (millis() - lastPrintTime > 300) {
+    Serial.print("Angle: ");
+    Serial.print(scanAngle);
+    Serial.print("°, Distance: ");
+    Serial.print(currentDistance);
+    Serial.println(" cm");
+    lastPrintTime = millis();
+  }
+}
+
+void checkObstacle() {
+  // Проверяем препятствия только когда система активна
+  if (!systemActive) return;
+  
+  // Проверяем, есть ли препятствие
+  if (currentDistance < obstacleThreshold && currentDistance > 0) {
+    if (!obstacleDetected) {
+      obstacleDetected = true;
+      Serial.println("Obstacle detected! Turning...");
+    }
+    
+    // Поворачиваем в зависимости от направления сканирования
+    if (currentMode == LINE_FOLLOWING) {
+      if (scanDirection == 1) {
+        turnLeft();
+      } else {
+        turnRight();
+      }
+      
+      // Короткая задержка для завершения поворота
+      delay(100);
+    }
+  } else {
+    obstacleDetected = false;
+  }
+}
+
+void followLine() {
+  // Если есть препятствие - не выполняем логику линии
+  if (obstacleDetected) return;
+  
+  // Чтение датчиков с инверсией (true = черная линия)
+  boolean leftOnLine = !digitalRead(leftSensor);
+  boolean rightOnLine = !digitalRead(rightSensor);
+  
+  // Логика следования по линии - робот остается на линии
+  if (leftOnLine && rightOnLine) {
+    moveForward(normalSpeed);
+  }
+  else if (leftOnLine && !rightOnLine) {
+    turnRight();
+  }
+  else if (!leftOnLine && rightOnLine) {
+    turnLeft();
+  }
+  else {
+    moveForward(normalSpeed);
+  }
+}
+
+void makeSquare() {
+  // Если есть препятствие - приостанавливаем выполнение квадрата
+  if (obstacleDetected) {
+    stopMotors();
+    return;
+  }
+  
+  switch (squareStep) {
+    case 0:
+      moveForward(normalSpeed);
+      if (millis() - actionStartTime > 5000) {
+        squareStep = 1;
+        actionStartTime = millis();
+        stopMotors();
+      }
+      break;
+      
+    case 1:
+      if (millis() - actionStartTime > 2000) {
+        squareStep = 2;
+        actionStartTime = millis();
+      }
+      break;
+      
+    case 2:
+      turnRightInPlace();
+      if (millis() - actionStartTime > 500) {
+        squareStep = 3;
+        actionStartTime = millis();
+        stopMotors();
+      }
+      break;
+      
+    case 3:
+      if (millis() - actionStartTime > 2000) {
+        sidesCompleted++;
+        Serial.print("Completed side: ");
+        Serial.println(sidesCompleted);
+        
+        if (sidesCompleted >= 4) {
+          currentMode = STOP;
+          Serial.println("Square completed!");
+        } else {
+          squareStep = 0;
+          actionStartTime = millis();
+        }
+      }
+      break;
+  }
+}
+
+void moveForward(int speed) {
+  digitalWrite(dirLeft, HIGH);
+  digitalWrite(dirRight, HIGH);
+  analogWrite(speedLeft, speed);
+  analogWrite(speedRight, speed);
+}
+
+void turnRight() {
+  digitalWrite(dirLeft, HIGH);
+  digitalWrite(dirRight, HIGH);
+  analogWrite(speedLeft, turnSpeed);
+  analogWrite(speedRight, 0);
+}
+
+void turnLeft() {
+  digitalWrite(dirLeft, HIGH);
+  digitalWrite(dirRight, HIGH);
+  analogWrite(speedLeft, 0);
+  analogWrite(speedRight, turnSpeed);
+}
+
+void turnRightInPlace() {
+  digitalWrite(dirLeft, HIGH);
+  digitalWrite(dirRight, LOW);
+  analogWrite(speedLeft, turnSpeed);
+  analogWrite(speedRight, turnSpeed);
+}
+
+void stopMotors() {
+  analogWrite(speedLeft, 0);
+  analogWrite(speedRight, 0);
+}
